@@ -61,6 +61,10 @@ class GuqinRealtimeRuntime:
         expected_strings: int = 7,
         min_foreground_ratio: float = 0.001,
         recalibration_cooldown_frames: int = 10,
+        always_recalibrate: bool = False,
+        force_recalibrate_every_n: int = 0,
+        tracker_max_inlier_dist_px: float = 8.0,
+        tracker_recal_inlier_threshold: float = 0.7,
     ) -> None:
         if mode not in {"resize", "sliding"}:
             raise ValueError(f"unsupported mode: {mode}")
@@ -80,12 +84,24 @@ class GuqinRealtimeRuntime:
             checkpoint = self.sam_guqin_dir / "checkpoints" / "guqin_best.pth"
         else:
             checkpoint = Path(checkpoint_path).expanduser().resolve()
+        if not checkpoint.exists():
+            raise FileNotFoundError(
+                "Guqin model checkpoint was not found: "
+                f"{checkpoint}\n"
+                "Download or train guqin_best.pth, then place it at "
+                "<repo>/SAM_guqin/checkpoints/guqin_best.pth, or run with "
+                "--ros-args -p checkpoint_path:=/path/to/guqin_best.pth"
+            )
         self.checkpoint_path = str(checkpoint)
         self.threshold = float(threshold)
         self.mode = mode
         self.expected_strings = int(expected_strings)
         self.min_foreground_ratio = float(min_foreground_ratio)
         self.recalibration_cooldown_frames = int(recalibration_cooldown_frames)
+        self.always_recalibrate = bool(always_recalibrate)
+        self.force_recalibrate_every_n = max(0, int(force_recalibrate_every_n))
+        self.tracker_max_inlier_dist_px = float(tracker_max_inlier_dist_px)
+        self.tracker_recal_inlier_threshold = float(tracker_recal_inlier_threshold)
 
         self.model = self.load_model(self.checkpoint_path)
         self.predict_fn = (
@@ -95,6 +111,13 @@ class GuqinRealtimeRuntime:
         self.tracker: Any | None = None
         self.frame_index = 0
         self.last_recalibration_frame = -10_000
+
+    def _new_tracker(self, model: Any) -> Any:
+        return self.StringTracker(
+            model,
+            max_inlier_dist_px=self.tracker_max_inlier_dist_px,
+            recal_inlier_threshold=self.tracker_recal_inlier_threshold,
+        )
 
     def _segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -133,11 +156,20 @@ class GuqinRealtimeRuntime:
         calibrated = False
         recalibrated = False
 
-        if self.tracker is None:
+        force_periodic_recalibration = (
+            self.force_recalibrate_every_n > 0
+            and self.frame_index % self.force_recalibrate_every_n == 0
+        )
+
+        tracker_was_uninitialized = self.tracker is None
+        if tracker_was_uninitialized or self.always_recalibrate or force_periodic_recalibration:
             model = self.calibrator.calibrate(mask)
-            self.tracker = self.StringTracker(model)
+            self.tracker = self._new_tracker(model)
             self.last_recalibration_frame = self.frame_index
-            calibrated = True
+            if tracker_was_uninitialized:
+                calibrated = True
+            else:
+                recalibrated = True
         else:
             model = self.tracker.update(mask)
             if getattr(model, "_needs_recalibration", False):
@@ -147,7 +179,7 @@ class GuqinRealtimeRuntime:
                 )
                 if cooldown_ok:
                     model = self.calibrator.calibrate(mask)
-                    self.tracker = self.StringTracker(model)
+                    self.tracker = self._new_tracker(model)
                     self.last_recalibration_frame = self.frame_index
                     recalibrated = True
 

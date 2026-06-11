@@ -56,6 +56,26 @@ class GuqinStringRealtimeNode(Node):
             ParameterDescriptor(description="Expected string count"),
         )
         self.declare_parameter(
+            "always_recalibrate",
+            False,
+            ParameterDescriptor(description="Run full string calibration on every valid frame"),
+        )
+        self.declare_parameter(
+            "force_recalibrate_every_n",
+            0,
+            ParameterDescriptor(description="Run full calibration every N valid frames, 0 disables"),
+        )
+        self.declare_parameter(
+            "tracker_max_inlier_dist_px",
+            8.0,
+            ParameterDescriptor(description="Maximum tracker assignment distance in pixels"),
+        )
+        self.declare_parameter(
+            "tracker_recal_inlier_threshold",
+            0.7,
+            ParameterDescriptor(description="Recalibrate when tracker inlier ratio is below this"),
+        )
+        self.declare_parameter(
             "publish_mask_topic",
             "/guqin/strings_mask",
             ParameterDescriptor(description="Output mask topic"),
@@ -87,6 +107,10 @@ class GuqinStringRealtimeNode(Node):
         inference_mode = self.get_parameter("inference_mode").get_parameter_value().string_value
         mask_threshold = self.get_parameter("mask_threshold").get_parameter_value().double_value
         expected_strings = self.get_parameter("expected_strings").get_parameter_value().integer_value
+        always_recalibrate = self.get_parameter("always_recalibrate").get_parameter_value().bool_value
+        force_recalibrate_every_n = self.get_parameter("force_recalibrate_every_n").get_parameter_value().integer_value
+        tracker_max_inlier_dist_px = self.get_parameter("tracker_max_inlier_dist_px").get_parameter_value().double_value
+        tracker_recal_inlier_threshold = self.get_parameter("tracker_recal_inlier_threshold").get_parameter_value().double_value
         publish_mask_topic = self.get_parameter("publish_mask_topic").get_parameter_value().string_value
         publish_json_topic = self.get_parameter("publish_json_topic").get_parameter_value().string_value
         publish_overlay_topic = self.get_parameter("publish_overlay_topic").get_parameter_value().string_value
@@ -104,6 +128,10 @@ class GuqinStringRealtimeNode(Node):
             threshold=mask_threshold,
             mode=inference_mode,
             expected_strings=int(expected_strings),
+            always_recalibrate=bool(always_recalibrate),
+            force_recalibrate_every_n=int(force_recalibrate_every_n),
+            tracker_max_inlier_dist_px=float(tracker_max_inlier_dist_px),
+            tracker_recal_inlier_threshold=float(tracker_recal_inlier_threshold),
         )
 
         self.mask_pub = self.create_publisher(Image, publish_mask_topic, 10)
@@ -117,7 +145,10 @@ class GuqinStringRealtimeNode(Node):
         )
 
         self.get_logger().info(
-            f"listening image_topic={image_topic}, checkpoint={checkpoint_path}, mode={inference_mode}"
+            f"listening image_topic={image_topic}, checkpoint={checkpoint_path}, "
+            f"mode={inference_mode}, always_recalibrate={always_recalibrate}, "
+            f"force_recalibrate_every_n={force_recalibrate_every_n}, "
+            f"tracker_recal_inlier_threshold={tracker_recal_inlier_threshold:.3f}"
         )
 
     def _draw_overlay(self, frame_bgr, endpoints):

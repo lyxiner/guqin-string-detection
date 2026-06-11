@@ -127,13 +127,23 @@ source ~/guqin_ws/install/setup.bash
 mkdir -p ~/guqin_ws/src/guqin-string-detection/SAM_guqin/checkpoints
 ```
 
+可以下载作者提供的示例权重：
+
+```bash
+cd ~/guqin_ws/src/guqin-string-detection
+mkdir -p SAM_guqin/checkpoints
+wget -O SAM_guqin/checkpoints/guqin_best.pth \
+  https://huggingface.co/Spring14th/guqin_model/resolve/main/guqin_best.pth
+```
+
 也可以在启动检测节点时手动指定权重路径：
 
 ```bash
 ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
   -p checkpoint_path:=/path/to/guqin_best.pth
 ```
-> 个人场景采集并训练后得到的模型可在[huggingface](https://huggingface.co/Spring14th/guqin_model/resolve/main/guqin_best.pth)中下载。
+
+如果你重新训练了模型，只需要把新的 `guqin_best.pth` 放到 `SAM_guqin/checkpoints/`，或用 `checkpoint_path` 参数指向新权重。
 
 ## Quick Start
 
@@ -356,6 +366,10 @@ python3 eval.py \
 | `inference_mode` | `sliding` | 推理模式，支持 `sliding` 或 `resize` |
 | `mask_threshold` | `0.5` | 分割阈值 |
 | `expected_strings` | `7` | 期望琴弦数量 |
+| `always_recalibrate` | `false` | 每个有效帧都重新完整拟合琴弦，最稳但更慢 |
+| `force_recalibrate_every_n` | `0` | 每 N 个有效帧强制重新完整拟合一次，0 表示关闭 |
+| `tracker_max_inlier_dist_px` | `8.0` | tracker 给采样点分配琴弦时允许的最大像素偏差 |
+| `tracker_recal_inlier_threshold` | `0.7` | tracker 内点比例低于该值时触发重新标定 |
 | `publish_mask_topic` | `/guqin/strings_mask` | 输出 mask 话题 |
 | `publish_overlay_topic` | `/guqin/strings_overlay` | 输出叠加图话题 |
 | `publish_json_topic` | `/guqin/strings_fit_json` | 输出 2D JSON 话题 |
@@ -423,6 +437,33 @@ ros2 topic list | grep guqin
 - Python 依赖没有安装完整
 - 输入图像话题名称不一致
 - 画面中琴弦太暗、反光太强或琴弦区域太小
+
+### Mask looks good but overlay lines are wrong
+
+如果 `/guqin/strings_mask` 看起来正常，但 `/guqin/strings_overlay` 中 7 根拟合线错位或串线，通常说明分割模型没有问题，问题在琴弦 tracker 没有及时重新标定。琴或相机移动后尤其容易出现这个现象。
+
+调试时可以先使用最稳的模式：每帧都重新完整拟合琴弦。
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p always_recalibrate:=true
+```
+
+如果这样 overlay 变准，说明模型和 mask 是可用的，只是 tracker 参数需要更保守。实时运行时可改成定期重标定：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p force_recalibrate_every_n:=5
+```
+
+或者提高 tracker 的重标定敏感度：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p tracker_recal_inlier_threshold:=0.9
+```
+
+如果琴在运行过程中会被移动，建议优先使用 `force_recalibrate_every_n`，例如 5 或 10。代价是 CPU/GPU 负载更高、输出频率更低，但拟合稳定性会明显更好。
 
 ### No `/guqin/strings_3d_json`
 

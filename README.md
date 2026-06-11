@@ -133,6 +133,7 @@ mkdir -p ~/guqin_ws/src/guqin-string-detection/SAM_guqin/checkpoints
 ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
   -p checkpoint_path:=/path/to/guqin_best.pth
 ```
+> 个人场景采集并训练后得到的模型可在[huggingface](https://huggingface.co/Spring14th/guqin_model/resolve/main/guqin_best.pth)中下载。
 
 ## Quick Start
 
@@ -434,9 +435,3 @@ ros2 topic echo /k4a/rgb/camera_info --once
 ```
 
 默认 `target_frame` 是 `rgb_camera_link`。如果改成其他坐标系，需要保证 TF 树里存在从 Kinect frame 到目标 frame 的变换。
-
-## Notes
-
-- 本仓库不包含 `.pth` 模型权重和大规模数据集文件，建议通过 Hugging Face 或其他数据仓库分发。
-- 本仓库不包含 Segment Anything 标注工具和 `sam_vit_h.pth`。
-- 本仓库不包含机械臂控制和自动演奏代码。

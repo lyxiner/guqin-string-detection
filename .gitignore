@@ -1,0 +1,15 @@
+build/
+install/
+log/
+
+__pycache__/
+*.py[cod]
+
+*.pth
+*.pt
+*.onnx
+*.zip
+
+.DS_Store
+.vscode/
+.idea/

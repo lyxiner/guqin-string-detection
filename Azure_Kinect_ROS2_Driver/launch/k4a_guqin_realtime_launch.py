@@ -26,6 +26,7 @@ def generate_launch_description():
         parameters=[
             {
                 "image_topic": "/k4a/rgb/image_raw",
+                "inference_mode": "resize",
             }
         ],
     )

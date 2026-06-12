@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -10,7 +12,11 @@ from cv_bridge import CvBridge
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    QoSProfile,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+)
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
@@ -42,8 +48,8 @@ class GuqinStringRealtimeNode(Node):
         )
         self.declare_parameter(
             "inference_mode",
-            "sliding",
-            ParameterDescriptor(description="resize or sliding"),
+            "resize",
+            ParameterDescriptor(description="resize or sliding (resize is ~10x faster)"),
         )
         self.declare_parameter(
             "mask_threshold",
@@ -137,12 +143,26 @@ class GuqinStringRealtimeNode(Node):
         self.mask_pub = self.create_publisher(Image, publish_mask_topic, 10)
         self.overlay_pub = self.create_publisher(Image, publish_overlay_topic, 10)
         self.json_pub = self.create_publisher(String, publish_json_topic, 10)
+
+        # latest-frame-wins: DDS 层只保留最新 1 帧, 不排队旧帧
+        latest_only_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._latest_msg: Image | None = None
+        self._latest_lock = threading.Lock()
+        self._busy = False
+
         self.image_sub = self.create_subscription(
             Image,
             image_topic,
             self.image_callback,
-            qos_profile_sensor_data,
+            latest_only_qos,
         )
+        # 推理不在图像回调里跑, 由定时器取"当前最新帧"处理,
+        # 处理期间到达的帧直接被覆盖丢弃, 延迟 = 单帧推理耗时
+        self.process_timer = self.create_timer(0.02, self.process_latest)
 
         self.get_logger().info(
             f"listening image_topic={image_topic}, checkpoint={checkpoint_path}, "
@@ -183,30 +203,67 @@ class GuqinStringRealtimeNode(Node):
         return overlay
 
     def image_callback(self, msg: Image) -> None:
+        # 只覆盖最新帧, 绝不在这里跑模型
+        with self._latest_lock:
+            self._latest_msg = msg
+
+    def process_latest(self) -> None:
+        if self._busy:
+            return
+        with self._latest_lock:
+            msg, self._latest_msg = self._latest_msg, None
+        if msg is None:
+            return
+
+        self._busy = True
+        try:
+            self._process_one(msg)
+        finally:
+            self._busy = False
+
+    def _process_one(self, msg: Image) -> None:
         try:
             frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as exc:
             self.get_logger().error(f"cv_bridge failed: {exc}")
             return
 
+        t0 = time.monotonic()
         try:
             result = self.runtime.process_frame(frame_bgr)
         except Exception as exc:
             self.get_logger().error(f"runtime failed: {exc}")
             return
+        infer_ms = (time.monotonic() - t0) * 1000.0
 
         if result is None:
             self.get_logger().warn("segmentation foreground too small, skip frame")
             return
 
+        stale_ms = (
+            self.get_clock().now().nanoseconds
+            - (msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec)
+        ) / 1e6
+        self.get_logger().info(
+            f"frame={result.frame_index} seg={result.seg_ms:.0f}ms "
+            f"track={result.track_ms:.0f}ms stale={stale_ms:.0f}ms "
+            f"roi={int(result.used_roi)} inliers={result.inlier_ratio:.2f} "
+            f"shift={result.shift_applied_px:+.0f}px",
+            throttle_duration_sec=2.0,
+        )
+
         mask_msg = self.bridge.cv2_to_imgmsg(result.mask, encoding="mono8")
         mask_msg.header = msg.header
         self.mask_pub.publish(mask_msg)
 
-        overlay = self._draw_overlay(frame_bgr, result.endpoints)
-        overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
-        overlay_msg.header = msg.header
-        self.overlay_pub.publish(overlay_msg)
+        # 没人看 overlay 就不画不发, 省下全分辨率绘制+序列化的开销
+        if self.overlay_pub.get_subscription_count() > 0:
+            overlay = self._draw_overlay(frame_bgr, result.endpoints)
+            overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
+            overlay_msg.header = msg.header
+            self.overlay_pub.publish(overlay_msg)
+        else:
+            overlay = None
 
         payload = self.runtime.result_to_json_dict(result)
         payload["header"] = {
@@ -232,6 +289,8 @@ class GuqinStringRealtimeNode(Node):
 
         if self.debug_overlay_dir and self.save_debug_every_n > 0:
             if result.frame_index % self.save_debug_every_n == 0:
+                if overlay is None:
+                    overlay = self._draw_overlay(frame_bgr, result.endpoints)
                 out_path = self.debug_overlay_dir / f"frame_{result.frame_index:06d}.jpg"
                 cv2.imwrite(str(out_path), overlay)
 

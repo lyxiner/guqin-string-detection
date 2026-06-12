@@ -1,47 +1,7 @@
-"""
-strings_realtime.py
-================================================================
-30+ Hz 实时琴弦跟踪.
-
-架构 (标定层 + 跟踪层):
-  StringCalibrator   一次性运行: 拿一帧无遮挡 mask, 跑完整 pipeline,
-                     得到 main_theta, 7 根弦的初始 (a, b) 轨迹.
-                     场景: 启动时, 或每次琴台被推动后用户触发.
-
-  StringTracker      每一帧调用 update(mask):
-                     1) ROI 切片 (避开图像大部分黑色区域)
-                     2) 列扫描: 按主方向降采样列,
-                        每列里把前景像素分成最多 7 组, 取每组中心 y
-                     3) 用上一帧的 (a, b) 给每个采样点分配 string_id
-                     4) 每根弦的采样点重新 weighted least squares 拟合 (a, b)
-                     5) 返回更新后的 7 个 String3D 端点
-                     时延目标: < 10 ms / frame
-
-为什么这个架构能稳:
-  - main_theta 几乎不变 (相机不动 + 琴只平移). 锁死它就免去了 1.4s 的 Hough;
-  - 列扫描比像素枚举快 50 倍, 因为我们只关心"主轴上每个采样位置 7 根弦在哪",
-    不需要每个像素都参与;
-  - Warm start: 上一帧的 (a, b) 是这一帧的极好初值, 1 轮迭代就收敛;
-  - 琴若被推动, (a, b) 跟着平移, 几帧内就追上, 不会丢锁.
-
-接口:
-  calibrator.calibrate(mask) -> StringModel
-  tracker = StringTracker(model)
-  while True:
-      mask = get_latest_mask()   # 来自分割模型 / SAM
-      strings_2d = tracker.update(mask)   # 7 根弦的 2D 端点
-      strings_3d = project_to_3d(strings_2d, K, T_base_cam, z_guqin)
-      send_to_moveit(strings_3d)
-================================================================
-"""
-
 import numpy as np
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-
-
-# ============================== 数据结构 ==============================
 
 @dataclass
 class StringTrack:
@@ -96,8 +56,14 @@ class StringCalibrator:
         self.n_strings = n_strings
         self.ransac_dist_px = ransac_dist_px
 
-    def calibrate(self, mask: np.ndarray) -> StringModel:
-        """mask: (H, W) bool/uint8, 返回 StringModel."""
+    def calibrate(self, mask: np.ndarray,
+                  theta_locked: Optional[float] = None) -> StringModel:
+        """mask: (H, W) bool/uint8, 返回 StringModel.
+
+        theta_locked: 给定时跳过 estimate_main_theta 的 Hough (~1.4s),
+        直接复用旧模型的主方向. 相机不动、琴只平移时 theta 不变,
+        重标定耗时从秒级降到几十毫秒.
+        """
         # 复用 mask_to_strings.py 里的完整 pipeline.
         # 这里直接 import 而不是重写, 保证标定结果和离线版本一致.
         import sys, os
@@ -112,12 +78,36 @@ class StringCalibrator:
         m = mask > 127 if mask.dtype != bool else mask
         m = remove_small_objects(m.copy(), min_size=200)
 
-        theta = mts.estimate_main_theta(m)
+        if theta_locked is None:
+            theta = mts.estimate_main_theta(m)
+        else:
+            theta = float(theta_locked)
         ys, xs, r = mts.project_perpendicular(m, theta)
-        centers_raw = mts.find_seven_centers(r, self.n_strings)
+        t_vals = mts.project_along_string(xs, ys, theta)
+
+        # 透视兜底: 琴窄端远离相机时弦扇形汇聚, 全局 r 直方图
+        # 远端的峰互相糊掉, find_seven_centers 找不齐 7 个峰.
+        # 此时退到 t 的端部窗口 (弦分得最开的那一段) 重新找峰.
+        centers_raw = None
+        try:
+            centers_raw = mts.find_seven_centers(r, self.n_strings)
+        except RuntimeError:
+            t_q30, t_q70 = np.quantile(t_vals, [0.3, 0.7])
+            for band in ((t_vals <= t_q30), (t_vals >= t_q70)):
+                if band.sum() < 300:
+                    continue
+                try:
+                    centers_raw = mts.find_seven_centers(
+                        r[band], self.n_strings)
+                    break
+                except RuntimeError:
+                    continue
+        if centers_raw is None:
+            raise RuntimeError(
+                f"find_seven_centers failed on full mask and both t-bands")
+
         order = mts.order_top_to_bottom(centers_raw, theta)
         centers = centers_raw[order]
-        t_vals = mts.project_along_string(xs, ys, theta)
         sid_per_px, tracks = mts.fit_string_tracks(
             t_vals, r, centers, n_iter=8, bin_size_px=28)
 
@@ -132,6 +122,25 @@ class StringCalibrator:
                                 np.min(t_lo_arr)))
         t_anchor_hi = float(min(np.percentile(t_hi_arr, 95),
                                 np.max(t_hi_arr)))
+
+        # 规范化弦序: fit_string_tracks 内部每轮迭代都按 r 升序重排,
+        # 把 order_top_to_bottom 的结果静默覆盖了. 而 r 与图像 y 的
+        # 对应关系取决于 sin(theta) 的符号 —— theta 跨 ±90° 回卷时
+        # (琴窄端远离相机带一点旋转就会发生), 弦序会整体翻成 7-1.
+        # 这里改按"图像坐标"排序: 在 t 中点处算每根弦的 (u, v),
+        # 主跨度在 v 就按 v 升序 (上→下), 在 u 就按 u 升序 (左→右),
+        # 与 theta 符号彻底解耦.
+        t_ref = 0.5 * (t_anchor_lo + t_anchor_hi)
+        sin_t, cos_t = np.sin(theta), np.cos(theta)
+        uv = []
+        for trk in tracks:
+            r_ref = float(trk["a"]) + float(trk["b"]) * t_ref
+            uv.append((r_ref * cos_t - t_ref * sin_t,
+                       r_ref * sin_t + t_ref * cos_t))
+        uv = np.asarray(uv)
+        axis = 1 if np.ptp(uv[:, 1]) >= np.ptp(uv[:, 0]) else 0
+        canon = np.argsort(uv[:, axis])
+        tracks = [tracks[i] for i in canon]
 
         return StringModel(
             theta_main=float(theta),
@@ -153,19 +162,29 @@ class StringTracker:
                  n_sample_cols: int = 96,
                  roi_pad_px: int = 60,
                  max_inlier_dist_px: float = 8.0,
-                 recal_inlier_threshold: float = 0.7):
+                 recal_inlier_threshold: float = 0.7,
+                 shift_search_px: int = 150,
+                 shift_search_step_px: int = 2,
+                 smoothing_alpha: float = 0.6):
         """
         n_sample_cols: 沿主轴方向降采样多少列 (96 列 * 7 弦 ≈ 672 个点已经够拟合 7 条直线)
         roi_pad_px: 用上一帧 7 根弦的位置算 ROI, 向两侧外扩这么多像素
         max_inlier_dist_px: 列扫描得到的弦中心与预测 r 的最大允许偏差
         recal_inlier_threshold: 当帧 inlier_ratio 低于此值时, model._needs_recalibration=True,
                                调用方应触发 StringCalibrator 重跑
+        shift_search_px: 丢锁时假设琴整体平移, 在 ±shift_search_px 内穷举全局
+                         delta_r, 找到 inlier 最多的平移量, 一帧内直接追上
+        smoothing_alpha: (a, b) 的 EMA 系数, new = alpha*fit + (1-alpha)*old.
+                         1.0 = 关闭平滑; 发生全局平移的那一帧自动跳过平滑
         """
         self.model = model
         self.n_sample_cols = n_sample_cols
         self.roi_pad_px = roi_pad_px
         self.max_inlier_dist_px = max_inlier_dist_px
         self.recal_inlier_threshold = recal_inlier_threshold
+        self.shift_search_px = int(shift_search_px)
+        self.shift_search_step_px = max(1, int(shift_search_step_px))
+        self.smoothing_alpha = float(smoothing_alpha)
         # 预计算
         self._theta = model.theta_main
         self._sin = np.sin(self._theta)
@@ -258,20 +277,12 @@ class StringTracker:
 
     # ---------- 弦更新 ----------
 
-    def _assign_and_refit(self, t_arr: np.ndarray,
-                           r_arr: np.ndarray
-                           ) -> Tuple[List[StringTrack], float]:
-        """每个采样点 (t, r) 分给最近的弦, 然后每根弦重拟合 (a, b).
-        返回 (new_tracks, inlier_ratio).
-
-        inlier_ratio 低 (< 0.3) 表示"采样点跟旧模型不匹配", 通常意味着琴大幅移动.
-        调用方应据此触发重新标定.
-        """
-        if len(t_arr) == 0:
-            return self.model.tracks, 0.0
-
-        a_arr = np.array([tr.a for tr in self.model.tracks])
-        b_arr = np.array([tr.b for tr in self.model.tracks])
+    def _fit_once(self, t_arr: np.ndarray, r_arr: np.ndarray,
+                  tracks: List[StringTrack]
+                  ) -> Tuple[List[StringTrack], float, np.ndarray]:
+        """单遍: 指派 -> 每弦 lstsq. 返回 (tracks, inlier_ratio, inlier_t)."""
+        a_arr = np.array([tr.a for tr in tracks])
+        b_arr = np.array([tr.b for tr in tracks])
         pred = a_arr[None, :] + t_arr[:, None] * b_arr[None, :]
         dr = np.abs(r_arr[:, None] - pred)
         sid = np.argmin(dr, axis=1)
@@ -283,7 +294,7 @@ class StringTracker:
         for k in range(self.n_strings):
             mm = valid & (sid == k)
             if mm.sum() < 4:
-                new_tracks.append(self.model.tracks[k])
+                new_tracks.append(tracks[k])
                 continue
             tt = t_arr[mm]; rr = r_arr[mm]
             A = np.stack([np.ones_like(tt), tt], axis=1)
@@ -291,7 +302,99 @@ class StringTracker:
             new_tracks.append(StringTrack(string_id=k + 1,
                                            a=float(coef[0]),
                                            b=float(coef[1])))
-        return new_tracks, inlier_ratio
+        return new_tracks, inlier_ratio, t_arr[valid]
+
+    def _assign_and_refit(self, t_arr: np.ndarray,
+                           r_arr: np.ndarray,
+                           tracks: Optional[List[StringTrack]] = None
+                           ) -> Tuple[List[StringTrack], float, np.ndarray]:
+        """两遍拟合.
+
+        琴带旋转时, 远离转轴处的采样点偏差会超过弦间距的一半,
+        被指派到相邻弦上, 正负残差在 lstsq 里相互抵消, b 拟不出来 (混叠).
+        对策: 第一遍只用 t 中央窗口的样本 (力臂小, 偏差不足以跨弦,
+        指派必然正确) 粗估每弦 (a, b); 第二遍用粗估结果重新指派
+        全体样本, 再做全跨度精拟合. 每帧迭代一次, 几帧内追上旋转.
+        """
+        if tracks is None:
+            tracks = self.model.tracks
+        if len(t_arr) == 0:
+            return tracks, 0.0, np.empty(0)
+
+        if len(t_arr) >= 50:
+            t_mid = float(np.median(t_arr))
+            span = float(np.quantile(t_arr, 0.9) - np.quantile(t_arr, 0.1))
+            central = np.abs(t_arr - t_mid) < 0.25 * max(span, 1.0)
+            if central.sum() >= 30:
+                tracks, _, _ = self._fit_once(
+                    t_arr[central], r_arr[central], tracks)
+
+        return self._fit_once(t_arr, r_arr, tracks)
+
+    def _estimate_motion(self, t_arr: np.ndarray,
+                          r_arr: np.ndarray,
+                          search_px: Optional[int] = None,
+                          step_px: Optional[int] = None,
+                          q_max: float = 0.05,
+                          q_step: float = 0.01
+                          ) -> Tuple[float, float, float, int]:
+        """刚体运动假设下的 (平移 delta, 旋转斜率 q) 二维穷举.
+
+        琴是刚体: 平移让 7 根弦的 r 同加 delta, 小角度旋转让残差
+        随 t 线性变化 (斜率 q). 只搜一维 delta 时, 纯旋转会被迫
+        "翻译"成错误的平移 (一侧残差恰好推进邻弦窗口, 评分虚高).
+        二维联合搜索后, 旋转归旋转、平移归平移, 互不污染.
+
+        返回 (delta, q, inlier_ratio, coverage). q 以 t_mid 为支点.
+
+        混叠防护: "错位一根弦"的别名也能让 6/7 样本匹配,
+        因此评分字典序: 先比有数据支撑的弦数 (coverage), 再比 inlier.
+        """
+        if len(t_arr) < 30:
+            return 0.0, 0.0, 0.0, 0
+        search = self.shift_search_px if search_px is None else int(search_px)
+        step = self.shift_search_step_px if step_px is None else max(1, int(step_px))
+        a_arr = np.array([tr.a for tr in self.model.tracks])
+        b_arr = np.array([tr.b for tr in self.model.tracks])
+        pred = a_arr[None, :] + t_arr[:, None] * b_arr[None, :]
+        dr0 = r_arr[:, None] - pred                           # (N, 7)
+        t_mid = float(np.median(t_arr))
+        tc = (t_arr - t_mid)[:, None]                         # (N, 1)
+
+        # 早退: 先验证"静止假设" (delta=0, q=0). 绝大多数帧琴没动,
+        # inlier 和覆盖都健康就不必跑二维穷举, 静止帧保持毫秒级.
+        hit0 = np.abs(dr0) < self.max_inlier_dist_px
+        ratio_0 = float(hit0.any(axis=1).mean())
+        cov_0 = int((hit0.sum(axis=0) >= 8).sum())
+        if ratio_0 >= 0.9 and cov_0 >= self.n_strings - 1:
+            return 0.0, 0.0, ratio_0, cov_0
+
+        deltas = np.arange(-search, search + 1, step, dtype=np.float64)
+        qs = np.arange(-q_max, q_max + q_step / 2, q_step)
+
+        best = (-1.0, 0.0, 0.0, 0.0, 0)  # score, delta, q, ratio, cov
+        for q in qs:
+            res = dr0 - q * tc                                # (N, 7)
+            dist = np.abs(res[None, :, :] - deltas[:, None, None])
+            hit = dist < self.max_inlier_dist_px              # (D, N, 7)
+            inl = hit.any(axis=2).mean(axis=1)                # (D,)
+            coverage = (hit.sum(axis=1) >= 8).sum(axis=1)     # (D,)
+            score = coverage * 10.0 + inl
+            k = int(np.argmax(score))
+            if score[k] > best[0]:
+                best = (float(score[k]), float(deltas[k]), float(q),
+                        float(inl[k]), int(coverage[k]))
+        _, delta, q, ratio, cov = best
+        return delta, q, ratio, cov
+
+    def _apply_motion(self, tracks: List[StringTrack],
+                       delta: float, q: float,
+                       t_mid: float) -> List[StringTrack]:
+        """把 (delta, q) 折进 (a, b): r = a + bt + delta + q(t - t_mid)."""
+        return [StringTrack(tr.string_id,
+                            a=tr.a + delta - q * t_mid,
+                            b=tr.b + q)
+                for tr in tracks]
 
     @property
     def n_strings(self) -> int:
@@ -316,24 +419,100 @@ class StringTracker:
             x_lo, x_hi = self._compute_roi()
             t_arr, r_arr = self._scan_rows(mask, x_lo, x_hi)
 
-        new_tracks, inlier_ratio = self._assign_and_refit(t_arr, r_arr)
+        # 预对齐: 运动造成的帧间相干滞后 (平移+小旋转), 先用小范围
+        # 二维搜索补掉, 再做指派. 否则模型误差一旦接近半弦距 (~9px),
+        # 样本离邻弦反而比离本弦近, 整组被邻弦捕获, 拟合污染成斜线.
+        base_tracks = self.model.tracks
+        t_mid0 = float(np.median(t_arr)) if len(t_arr) else 0.0
+        delta0, q0, ratio0, cov0 = self._estimate_motion(
+            t_arr, r_arr, search_px=30, step_px=1)
+        # 只有"全部弦都有数据支撑"的运动假设才可信 (允许 1 根被遮挡);
+        # 错位 N 根弦的混叠别名必然缺弦, 在这里被挡掉
+        if ((abs(delta0) > 0.5 or abs(q0) > 0.005) and ratio0 >= 0.6
+                and cov0 >= self.n_strings - 1):
+            base_tracks = self._apply_motion(self.model.tracks,
+                                             delta0, q0, t_mid0)
+
+        new_tracks, inlier_ratio, t_in = self._assign_and_refit(
+            t_arr, r_arr, tracks=base_tracks)
+        shift_applied = 0.0
+
+        # 丢锁快速恢复: 琴大概率只是被大幅平移/轻微旋转了.
+        # 全图重扫 (旧 ROI 可能已经罩不住新位置), 大范围二维搜索,
+        # 若 inlier 明显回升, 直接把 7 根弦一起搬过去, 免去重标定.
+        if inlier_ratio < self.recal_inlier_threshold:
+            if self._scan_along_x:
+                t_full, r_full = self._scan_columns(mask, 0, self._H)
+            else:
+                t_full, r_full = self._scan_rows(mask, 0, self._W)
+            delta, q, ratio_at_delta, cov = self._estimate_motion(
+                t_full, r_full)
+            if (ratio_at_delta > max(inlier_ratio + 0.15, 0.5)
+                    and cov >= self.n_strings - 1
+                    and (abs(delta) > 1.0 or abs(q) > 0.005)):
+                t_mid_f = float(np.median(t_full))
+                shifted = self._apply_motion(self.model.tracks,
+                                             delta, q, t_mid_f)
+                new_tracks, inlier_ratio, t_in = self._assign_and_refit(
+                    t_full, r_full, tracks=shifted)
+                t_arr = t_full
+                shift_applied = delta
+
+        # 移动检测: 各弦法向位移的中位数. 在动就跳过平滑 (否则拟合会拖在真弦后面)
+        da_med = float(np.median([abs(nt.a - ot.a)
+                                  for nt, ot in zip(new_tracks,
+                                                    self.model.tracks)]))
+        is_moving = (shift_applied != 0.0) or (da_med > 2.0)
+
+        # EMA 平滑: 仅在静止时压逐帧抖动
+        if self.smoothing_alpha < 1.0 and not is_moving:
+            alpha = self.smoothing_alpha
+            new_tracks = [
+                StringTrack(
+                    string_id=nt.string_id,
+                    a=alpha * nt.a + (1.0 - alpha) * ot.a,
+                    b=alpha * nt.b + (1.0 - alpha) * ot.b,
+                )
+                for nt, ot in zip(new_tracks, self.model.tracks)
+            ]
+
+        # t 锚点更新: 琴沿弦方向移动时, 线段端点必须跟着走,
+        # 否则 (a, b) 对了, 画出来的线段仍然和真弦错开一截.
+        # 扩张立即生效 (出现了更长的弦证据), 收缩用 EMA 慢慢跟 (抗遮挡).
+        t_lo, t_hi = self.model.t_anchor_lo, self.model.t_anchor_hi
+        if len(t_in) >= 100:
+            obs_lo = float(np.quantile(t_in, 0.01))
+            obs_hi = float(np.quantile(t_in, 0.99))
+            if is_moving:
+                t_lo, t_hi = obs_lo, obs_hi
+            else:
+                t_lo = obs_lo if obs_lo < t_lo else 0.7 * t_lo + 0.3 * obs_lo
+                t_hi = obs_hi if obs_hi > t_hi else 0.7 * t_hi + 0.3 * obs_hi
+
+        # 旋转看门狗: 琴整体旋转时, 7 根弦的 b 会一起偏向同一侧.
+        # 平移搜索修不了旋转, 必须触发重标定让上层重估 theta.
+        b_med = float(np.median([tr.b for tr in new_tracks]))
+        theta_drifted = abs(b_med) > 0.02  # ≈ 1.1°
 
         # 丢锁检测: inlier_ratio 低说明这一帧大部分采样点都不在旧模型预测附近,
-        # 通常是琴台被大幅推动了. 这种情况跟踪层无法仅用增量更新追上,
+        # 平移搜索也救不回来 (可能是旋转/遮挡/分割崩了),
         # 必须由上层触发标定层重跑.
-        needs_recal = (inlier_ratio < self.recal_inlier_threshold and
-                       len(t_arr) > 50)
+        needs_recal = ((inlier_ratio < self.recal_inlier_threshold and
+                        len(t_arr) > 50)
+                       or (theta_drifted and len(t_arr) > 50))
 
         self.model = StringModel(
             theta_main=self.model.theta_main,
             tracks=new_tracks,
-            t_anchor_lo=self.model.t_anchor_lo,
-            t_anchor_hi=self.model.t_anchor_hi,
+            t_anchor_lo=t_lo,
+            t_anchor_hi=t_hi,
             image_hw=self.model.image_hw,
         )
         self.model._inlier_ratio = inlier_ratio
         self.model._needs_recalibration = needs_recal
         self.model._n_samples = int(len(t_arr))
+        self.model._shift_applied_px = float(shift_applied)
+        self.model._theta_drifted = theta_drifted
         return self.model
 
 

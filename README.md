@@ -2,24 +2,9 @@
 
 本项目用于使用 Azure Kinect DK 和 ROS2 对古琴琴弦进行实时视觉检测。系统从 Kinect RGB 图像中分割琴弦，实时拟合 7 根琴弦的 2D 端点，并可结合 Kinect 对齐深度图发布相机坐标系下的 3D 琴弦线段。
 
-本仓库只包含视觉检测、深度定位和模型训练相关代码，不包含机械臂控制、灵巧手控制和自动演奏流程。
-
 ## Demo
 
 ![检测效果](./检测效果.gif)
-
-## Features
-
-- Azure Kinect DK ROS2 驱动
-- 古琴琴弦 UNet 分割模型推理
-- 7 根琴弦实时跟踪和 2D 端点拟合
-- latest-frame-wins 图像处理：只处理最新帧，不积压旧帧
-- 默认 `resize` 推理模式，延迟低；也支持 `sliding` 高精度模式
-- ROI 推理加速：跟踪稳定后只对琴弦附近区域分割，必要时自动回退全图
-- 琴移动后的平移/小旋转恢复、快速 PCA 重标定和弦序对齐
-- overlay 按需发布：只有订阅者查看时才绘制叠加图，降低负载
-- 可选 Kinect 深度图反投影，输出 3D 琴弦线段
-- 支持用户准备自己的图片和 mask 后继续训练或微调模型
 
 ## Repository Structure
 
@@ -566,9 +551,3 @@ ros2 topic echo /k4a/rgb/camera_info --once
 ```
 
 默认 `target_frame` 是 `rgb_camera_link`。如果改成其他坐标系，需要保证 TF 树里存在从 Kinect frame 到目标 frame 的变换。
-
-## Notes
-
-- 本仓库不包含 `.pth` 模型权重和大规模数据集文件，建议通过 Hugging Face 或其他数据仓库分发。
-- 本仓库不包含 Segment Anything 标注工具和 `sam_vit_h.pth`。
-- 本仓库不包含机械臂控制和自动演奏代码。

@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 
 import cv2
-import numpy as np
 
 import rclpy
-from sensor_msgs.msg import Imu
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CameraInfo
-from geometry_msgs.msg import Pose
-from geometry_msgs.msg import Point
-from geometry_msgs.msg import Quaternion
 
 from cv_bridge import CvBridge
 
-import numpy as np
 g_node = None
 cv_bridge = None
 
@@ -97,24 +91,8 @@ def main(args=None):
 
     cv_bridge = CvBridge()
 
-    #subscription_imu = g_node.create_subscription(Imu, '/k4a/imu', imu_callback, 10)
-    #g_node.get_logger().info("Subscribed to %s" % subscription_imu.topic_name)
-
-    #subscription_rgb_rect = g_node.create_subscription(Image, '/k4a/rgb_to_depth/image_rect', rgb_rect_callback, 10)
-    #g_node.get_logger().info("Subscribed to %s" % subscription_rgb_rect.topic_name)
-
-    #subscription_rgb_raw = g_node.create_subscription(Image, '/k4a/rgb_to_depth/image_raw', rgb_raw_callback, 10)
-    #g_node.get_logger().info("Subscribed to %s" % subscription_rgb_raw.topic_name)
-
     subscription_rgb_raw = g_node.create_subscription(Image, '/k4a/rgb/image_raw', rgb_raw_callback, 10)
     g_node.get_logger().info("Subscribed to %s" % subscription_rgb_raw.topic_name)
-
-
-    #subscription_depth_raw = g_node.create_subscription(Image, '/k4a/depth/image_raw', depth_raw_callback, 10)
-    #g_node.get_logger().info("Subscribed to %s" % subscription_depth_raw.topic_name)
-
-    #subscription_depth_rect = g_node.create_subscription(Image, '/k4a/depth/image_rect', depth_rect_callback, 10)
-    #g_node.get_logger().info("Subscribed to %s" % subscription_depth_rect.topic_name)
 
     subscription_depth_to_rgb = g_node.create_subscription(Image, '/k4a/depth_to_rgb/image_raw', depth_rgb_callback, 10)
     g_node.get_logger().info("Subscribed to %s" % subscription_depth_to_rgb.topic_name)
@@ -122,16 +100,9 @@ def main(args=None):
     subscription_rgb_info = g_node.create_subscription(CameraInfo, '/k4a/rgb/camera_info', rgb_info_callback, 10)
     g_node.get_logger().info("Subscribed to %s" % subscription_rgb_info.topic_name)
 
-    #subscription_depth_info = g_node.create_subscription(CameraInfo, '/k4a/depth/camera_info', depth_info_callback, 10)
-    #g_node.get_logger().info("Subscribed to %s" % subscription_depth_info.topic_name)
-
-
     while rclpy.ok():
         rclpy.spin_once(g_node)
 
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
     g_node.destroy_node()
     rclpy.shutdown()
 

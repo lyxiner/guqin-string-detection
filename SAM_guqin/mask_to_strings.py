@@ -1,26 +1,4 @@
-"""
-古琴琴弦拟合 v5: 智能端点补全 (基于"最长弦"锚点)
-
-核心策略:
-  v4 已经能正确拟合每根弦的直线, 端点取自 inlier 沿弦方向 t 的分位.
-  现在加上"补全": 找出所有 7 根弦中
-    - 沿弦方向 t 最小的那个端点 (t_min_global, 来自最伸向"龙龈"那头的弦)
-    - 沿弦方向 t 最大的那个端点 (t_max_global, 来自最伸向"岳山"那头的弦)
-  这两个 t 值定义了"理论上的最大弦长". 然后:
-    - 每根弦的最终端点 = 该弦直线 在 t = t_min_global 处的点 + t = t_max_global 处的点
-    - 这样所有弦的长度都拉到一致, 视觉上都"贯通"
-
-这跟 v2 用边界线相比的优势:
-  - v2 假设 7 个端点共线, 在 eval02 上对 (透视下岳山是一条斜线), 在 eval01 上错
-    (eval01 中 7 个端点不共线, 因为遮挡严重 + 弦尾自然散开);
-  - v5 不假设共线, 只取"最长那根弦能到达的最远 t", 在两种 mask 上都鲁棒.
-
-但这有一个限制需要用户知道:
-  - 如果某根弦两端都被遮挡得只剩中间一段, v5 也能正确补全 (因为它沿弦延伸)
-  - 如果"最伸向岳山的那根弦"也没真正到岳山 (整体右端都被切了), 那 v5 给的右端就只是
-    "可见的最远右端", 不是物理岳山. 这种情况只能靠先验或人工标定解决.
-  - 加了一个开关 --no-completion 可以关掉补全, 退回 v4 行为.
-"""
+"""Fit seven Guqin string centerlines from a binary mask."""
 
 import os
 import json
@@ -36,8 +14,6 @@ from skimage.transform import hough_line, hough_line_peaks
 
 RANSAC_DIST_PX_DEFAULT = 3.0
 
-
-# ==================== 圆量平均 (修了 v2 的方向 bug) ====================
 
 def circular_mean_line_angle(angles_rad):
     a = np.asarray(angles_rad, dtype=np.float64)
@@ -56,9 +32,6 @@ def estimate_main_theta(mask_bool, n_use=10):
     if len(angs) == 0:
         raise RuntimeError("Hough 找不到直线")
     return circular_mean_line_angle(angs[:min(n_use, len(angs))])
-
-
-# ==================== r 投影聚类 ====================
 
 def project_perpendicular(mask_bool, theta):
     ys, xs = np.nonzero(mask_bool)
@@ -105,9 +78,6 @@ def order_top_to_bottom(centers_r, theta):
 def assign_to_nearest(r_values, centers_r):
     diff = np.abs(r_values[:, None] - centers_r[None, :])
     return np.argmin(diff, axis=1) + 1
-
-
-# ==================== (t, r) 轨迹拟合 ====================
 
 def project_along_string(xs, ys, theta_main):
     s, c = np.sin(theta_main), np.cos(theta_main)
@@ -232,9 +202,6 @@ def point_on_track_at_t(theta_main, a, b, t):
     v = r * np.sin(theta_main) + t * np.cos(theta_main)
     return float(u), float(v)
 
-
-# ==================== RANSAC 直线拟合 (兜底保留) ====================
-
 def ransac_line_fit(xs, ys, dist_thresh, n_iter=300,
                     min_inlier_ratio=0.15, rng=None):
     if rng is None:
@@ -278,30 +245,13 @@ def ransac_line_fit(xs, ys, dist_thresh, n_iter=300,
 
 
 def t_quantile_endpoints(xs, ys, theta_main, q=(0.005, 0.995)):
-    """以全局 main_theta 计算每个像素的 t = -x*sin + y*cos,
-    返回 inliers 沿弦方向 t 的两个分位 (t_lo, t_hi).
-    用 main_theta 而不是每根弦自己的 theta, 保证所有弦的 t 是同一个坐标系."""
+    """Return endpoint quantiles in the shared along-string coordinate."""
     t = project_along_string(xs, ys, theta_main)
     return float(np.quantile(t, q[0])), float(np.quantile(t, q[1]))
 
 
 def point_on_line_at_t(theta, r, t, theta_main):
-    """给定弦直线 (theta, r) 和全局沿弦坐标 t (基于 theta_main),
-    返回该 t 在弦上的 (u, v) 像素坐标.
-
-    弦直线: u*cos(theta) + v*sin(theta) = r
-    全局沿弦方向: (-sin(theta_main), cos(theta_main))
-    取 (u, v) 同时满足上面两个条件即可:
-      点 P = O + t * d_main, O 是弦上某点, d_main 是全局沿弦单位向量;
-      约束: u*cos(theta_s) + v*sin(theta_s) = r 用来定 O 沿"垂直主方向"的偏移.
-
-    最简单的办法: 弦的法向 (cos(theta), sin(theta)),
-                 全局沿弦方向 d_m = (-sin(theta_main), cos(theta_main)).
-    设 P = alpha * n_s + t * d_m, 其中 n_s = (cos(theta_s), sin(theta_s)).
-    弦方程: P . n_s = r =>  alpha * (n_s.n_s) + t * (d_m.n_s) = r
-                      =>  alpha + t * (d_m . n_s) = r   (n_s 是单位向量)
-                      =>  alpha = r - t * (d_m . n_s)
-    """
+    """Return the image point on a string line at shared coordinate t."""
     nx_s, ny_s = np.cos(theta), np.sin(theta)
     dx_m, dy_m = -np.sin(theta_main), np.cos(theta_main)
     dm_dot_ns = dx_m * nx_s + dy_m * ny_s
@@ -309,9 +259,6 @@ def point_on_line_at_t(theta, r, t, theta_main):
     u = alpha * nx_s + t * dx_m
     v = alpha * ny_s + t * dy_m
     return float(u), float(v)
-
-
-# ==================== 主流程 ====================
 
 def main(mask_path, orig_path, out_dir,
          n_strings=7, min_size=200,
@@ -339,7 +286,6 @@ def main(mask_path, orig_path, out_dir,
         t_vals, r_vals, centers,
         n_iter=8, bin_size_px=28, min_bin_pts=15)
 
-    # 第一轮: 先在 (t, r) 坐标里拟合每根弦的中心轨迹 r = a + b*t
     rng = np.random.default_rng(0)
     string_data = []
     for sid, track in enumerate(tracks, 1):
@@ -360,7 +306,6 @@ def main(mask_path, orig_path, out_dir,
                 n_iter=ransac_iter, rng=rng)
             a_f = float(r_f)
             b_f = 0.0
-        # 注意: 用 main_theta 算 t (统一坐标系), 不用每根弦自己的 theta
         t_lo, t_hi = t_quantile_endpoints(
             xs_s[inl], ys_s[inl], theta_main)
         string_data.append({
@@ -378,16 +323,11 @@ def main(mask_path, orig_path, out_dir,
 
     valid = [d for d in string_data if d is not None]
 
-    # 第二轮: 全局补全锚点 = 所有弦中沿弦方向"伸得最远"的两个 t
     if do_completion and len(valid) > 0:
-        # 鲁棒地取: t_lo 的 5% 分位 (避免单根弦极端值), t_hi 的 95% 分位
         t_lo_arr = np.array([d["t_lo_raw"] for d in valid])
         t_hi_arr = np.array([d["t_hi_raw"] for d in valid])
-        # 真正延伸最远的端点应该是 min(t_lo) 和 max(t_hi),
-        # 但用 5%/95% 分位能避免错检测 (比如 mask 把背景误识别成弦)
         t_global_lo = float(np.percentile(t_lo_arr, 5))
         t_global_hi = float(np.percentile(t_hi_arr, 95))
-        # 但不要比真实最远更远
         t_global_lo = max(t_global_lo, t_lo_arr.min())
         t_global_hi = min(t_global_hi, t_hi_arr.max())
         print(f"[info] global anchors: t_lo={t_global_lo:.0f}, "
@@ -397,7 +337,6 @@ def main(mask_path, orig_path, out_dir,
     else:
         t_global_lo = t_global_hi = None
 
-    # 算最终端点
     fits = []
     for d in string_data:
         if d is None:
@@ -412,7 +351,6 @@ def main(mask_path, orig_path, out_dir,
             t_end = d["t_hi_raw"]
         p_start = point_on_track_at_t(theta_main, a_s, b_s, t_start)
         p_end = point_on_track_at_t(theta_main, a_s, b_s, t_end)
-        # raw 端点也算出来供对比
         p_start_raw = point_on_track_at_t(
             theta_main, a_s, b_s, d["t_lo_raw"])
         p_end_raw = point_on_track_at_t(
@@ -449,7 +387,6 @@ def main(mask_path, orig_path, out_dir,
         print(f"[info] string{sid}: len={fits[-1]['length_pixel']:.0f}px"
               f" ext_s={ext_start:.0f} ext_e={ext_end:.0f}{flag}")
 
-    # 叠加到原图
     orig = Image.open(orig_path).convert("RGB")
     if orig.size != (W, H):
         orig = orig.resize((W, H), Image.BILINEAR)
@@ -472,7 +409,6 @@ def main(mask_path, orig_path, out_dir,
     orig.save(overlay_path, optimize=True)
     print(f"[ok] overlay -> {overlay_path}")
 
-    # debug
     fig, ax = plt.subplots(figsize=(14, 10))
     ax.imshow(mask, cmap="gray")
     for sid, fit in enumerate(fits, 1):
@@ -488,7 +424,7 @@ def main(mask_path, orig_path, out_dir,
                 label=f"string{sid}")
         ax.plot([u0, u1], [v0, v1], "o", color=col, ms=8)
     ax.set_xlim(0, W); ax.set_ylim(H, 0)
-    ax.set_title(f"v5 fit + completion (string thresh={ransac_dist_px}px, "
+    ax.set_title(f"string fit (threshold={ransac_dist_px}px, "
                  f"main_theta={np.rad2deg(theta_main):.1f} deg)")
     ax.legend(loc="upper left", fontsize=8); ax.axis("off")
     fig.tight_layout()
@@ -524,15 +460,15 @@ def main(mask_path, orig_path, out_dir,
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mask", default="/home/wz/Git/SAM_guqin/infer_results/eval03_mask.png")
-    ap.add_argument("--orig", default="/home/wz/Git/SAM_guqin/eval03.jpg")
-    ap.add_argument("--out",  default="/home/wz/Git/SAM_guqin/infer_results")
+    ap.add_argument("--mask", required=True)
+    ap.add_argument("--orig", required=True)
+    ap.add_argument("--out", default="./infer_results")
     ap.add_argument("--ransac-dist-px", type=float,
                     default=RANSAC_DIST_PX_DEFAULT)
     ap.add_argument("--ransac-iter", type=int, default=300)
     ap.add_argument("--min-size", type=int, default=200)
     ap.add_argument("--no-completion", action="store_true",
-                    help="Disable end-point completion (debug)")
+                    help="Disable end-point completion")
     args = ap.parse_args()
     main(args.mask, args.orig, args.out,
          ransac_dist_px=args.ransac_dist_px,

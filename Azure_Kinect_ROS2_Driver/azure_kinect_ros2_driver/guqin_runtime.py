@@ -123,7 +123,7 @@ class GuqinRealtimeRuntime:
         self.tracker: Any | None = None
         self.frame_index = 0
         self.last_recalibration_frame = -10_000
-        self._fg_px_ref: float | None = None  # 全琴可见时的前景像素数基准
+        self._fg_px_ref: float | None = None
 
     def _new_tracker(self, model: Any) -> Any:
         return self.StringTracker(
@@ -134,7 +134,7 @@ class GuqinRealtimeRuntime:
         )
 
     def _roi_from_tracker(self) -> tuple[int, int, int, int] | None:
-        """用上一帧 7 根弦的端点算包围盒, 外扩 pad. 返回 (x0, y0, x1, y1)."""
+        """Build an inference ROI from the current string endpoints."""
         if self.tracker is None:
             return None
         model = self.tracker.model
@@ -149,7 +149,6 @@ class GuqinRealtimeRuntime:
         x1 = min(W, int(pts[:, 0].max()) + pad)
         y0 = max(0, int(pts[:, 1].min()) - pad)
         y1 = min(H, int(pts[:, 1].max()) + pad)
-        # ROI 太小或退化时放弃, 走全图
         if (x1 - x0) < 64 or (y1 - y0) < 64:
             return None
         return x0, y0, x1, y1
@@ -159,11 +158,7 @@ class GuqinRealtimeRuntime:
         frame_bgr: np.ndarray,
         roi: tuple[int, int, int, int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """ROI 给定时只对裁剪区推理, 再贴回全尺寸图.
-
-        resize 模式下这一步同时提速和提准: 网络输入分辨率固定,
-        喂进去的区域越小, 琴弦占的有效像素越多, mask 越细.
-        """
+        """Segment the frame, optionally on a cropped ROI."""
         if roi is not None:
             x0, y0, x1, y1 = roi
             crop_rgb = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
@@ -178,13 +173,7 @@ class GuqinRealtimeRuntime:
         return prob_map, mask
 
     def _fast_theta(self, mask: np.ndarray) -> float | None:
-        """PCA 估主方向, 几毫秒级, 替代 1.4s 的 Hough.
-
-        弦像素在 mask 里占绝对主导, 前景坐标的主成分方向就是弦方向 d;
-        theta 是法线角 (r = x cosθ + y sinθ, 同 skimage Hough 约定),
-        由 (-sinθ, cosθ) ∥ d 解出 θ = atan2(-dx, dy), 折回 [-90°, 90°).
-        相比锁死旧 theta, 它对琴的旋转是新鲜估计.
-        """
+        """Estimate the string normal angle with PCA on foreground pixels."""
         ys, xs = np.nonzero(mask)
         if len(xs) < 200:
             return None
@@ -196,7 +185,7 @@ class GuqinRealtimeRuntime:
         cov = np.array([[np.dot(x, x), np.dot(x, y)],
                         [np.dot(x, y), np.dot(y, y)]]) / len(x)
         w, v = np.linalg.eigh(cov)
-        dx, dy = v[:, int(np.argmax(w))]  # 主方向 (沿弦)
+        dx, dy = v[:, int(np.argmax(w))]
         theta = float(np.arctan2(-dx, dy))
         if theta >= np.pi / 2:
             theta -= np.pi
@@ -205,13 +194,7 @@ class GuqinRealtimeRuntime:
         return theta
 
     def _align_string_ids(self, new_model: Any, old_model: Any) -> Any:
-        """重标定后, 让新模型的编号方向继承旧模型.
-
-        标定层的规范化排序保证了单次结果自洽, 但"弦1在哪一头"
-        是个约定; 跨次重标定时必须和旧模型对齐, 否则下游 3D 节点
-        和机械臂会拨错弦. 比较新旧模型各自弦1→弦N 的图像坐标走向,
-        方向相反就把新模型整组反转重编号.
-        """
+        """Keep string numbering direction stable across recalibration."""
         def _direction(model: Any) -> float:
             t_ref = 0.5 * (model.t_anchor_lo + model.t_anchor_hi)
             sin_t = np.sin(model.theta_main)
@@ -233,7 +216,7 @@ class GuqinRealtimeRuntime:
         return new_model
 
     def _safe_calibrate(self, mask: np.ndarray) -> Any | None:
-        """重标定: 用 PCA 快速估 theta 跳过 Hough; 失败退回完整标定."""
+        """Run calibration with a fast theta estimate when available."""
         theta_fast = None
         if self.lock_theta_on_recalibration and self.tracker is not None:
             theta_fast = self._fast_theta(mask)
@@ -283,9 +266,6 @@ class GuqinRealtimeRuntime:
         seg_ms = (_time.monotonic() - t0) * 1000.0
         mask_ratio = self._mask_ratio(mask)
 
-        # 前景看门狗: ROI 推理下前景像素数明显低于"全琴可见"的基准,
-        # 说明琴被移出了旧框 (mask 是半截琴), 立刻退回全图重分割.
-        # 拿半截琴去做平移搜索/重拟合正是"挪琴后拟合不上"的根源.
         fg_px = float((mask > 0).sum())
         roi_degraded = (
             roi is not None
@@ -318,7 +298,7 @@ class GuqinRealtimeRuntime:
             model = self._safe_calibrate(mask)
             if model is None:
                 if tracker_was_uninitialized:
-                    return None  # 首帧标定失败, 等下一帧
+                    return None
             else:
                 self.tracker = self._new_tracker(model)
                 self.last_recalibration_frame = self.frame_index
@@ -328,8 +308,6 @@ class GuqinRealtimeRuntime:
                     recalibrated = True
         else:
             model = self.tracker.update(mask)
-            # ROI mask 上丢锁: 先全图重分割, 让跟踪器在完整数据上做平移恢复.
-            # 这一步成功的话连重标定都不需要.
             if (roi is not None
                     and getattr(model, "_inlier_ratio", 1.0)
                     < self.tracker_recal_inlier_threshold):
@@ -346,8 +324,6 @@ class GuqinRealtimeRuntime:
                     >= self.recalibration_cooldown_frames
                 )
                 if cooldown_ok:
-                    # 跟踪器丢锁且 ROI 在用: 先全图重分割再标定,
-                    # 避免拿半张琴的 mask 去拟合 7 根弦
                     if roi is not None:
                         ts = _time.monotonic()
                         prob_map, mask = self._segment(frame_bgr, roi=None)
@@ -364,7 +340,6 @@ class GuqinRealtimeRuntime:
         assert self.tracker is not None
         active_model = self.tracker.model
 
-        # 更新"全琴可见"的前景基准: 只在跟踪健康时更新, 避免被异常帧污染
         if (getattr(active_model, "_inlier_ratio", 0.0)
                 >= self.tracker_recal_inlier_threshold):
             if self._fg_px_ref is None:

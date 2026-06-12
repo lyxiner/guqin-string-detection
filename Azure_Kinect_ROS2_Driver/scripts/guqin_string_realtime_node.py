@@ -82,6 +82,26 @@ class GuqinStringRealtimeNode(Node):
             ParameterDescriptor(description="Recalibrate when tracker inlier ratio is below this"),
         )
         self.declare_parameter(
+            "roi_inference",
+            True,
+            ParameterDescriptor(description="Run segmentation on tracker ROI when available"),
+        )
+        self.declare_parameter(
+            "roi_inference_pad_px",
+            100,
+            ParameterDescriptor(description="Pixel padding around tracker ROI"),
+        )
+        self.declare_parameter(
+            "lock_theta_on_recalibration",
+            True,
+            ParameterDescriptor(description="Use fast PCA theta estimate during recalibration"),
+        )
+        self.declare_parameter(
+            "tracker_smoothing_alpha",
+            0.6,
+            ParameterDescriptor(description="EMA smoothing alpha for still frames"),
+        )
+        self.declare_parameter(
             "publish_mask_topic",
             "/guqin/strings_mask",
             ParameterDescriptor(description="Output mask topic"),
@@ -117,6 +137,10 @@ class GuqinStringRealtimeNode(Node):
         force_recalibrate_every_n = self.get_parameter("force_recalibrate_every_n").get_parameter_value().integer_value
         tracker_max_inlier_dist_px = self.get_parameter("tracker_max_inlier_dist_px").get_parameter_value().double_value
         tracker_recal_inlier_threshold = self.get_parameter("tracker_recal_inlier_threshold").get_parameter_value().double_value
+        roi_inference = self.get_parameter("roi_inference").get_parameter_value().bool_value
+        roi_inference_pad_px = self.get_parameter("roi_inference_pad_px").get_parameter_value().integer_value
+        lock_theta_on_recalibration = self.get_parameter("lock_theta_on_recalibration").get_parameter_value().bool_value
+        tracker_smoothing_alpha = self.get_parameter("tracker_smoothing_alpha").get_parameter_value().double_value
         publish_mask_topic = self.get_parameter("publish_mask_topic").get_parameter_value().string_value
         publish_json_topic = self.get_parameter("publish_json_topic").get_parameter_value().string_value
         publish_overlay_topic = self.get_parameter("publish_overlay_topic").get_parameter_value().string_value
@@ -138,13 +162,16 @@ class GuqinStringRealtimeNode(Node):
             force_recalibrate_every_n=int(force_recalibrate_every_n),
             tracker_max_inlier_dist_px=float(tracker_max_inlier_dist_px),
             tracker_recal_inlier_threshold=float(tracker_recal_inlier_threshold),
+            roi_inference=bool(roi_inference),
+            roi_inference_pad_px=int(roi_inference_pad_px),
+            lock_theta_on_recalibration=bool(lock_theta_on_recalibration),
+            tracker_smoothing_alpha=float(tracker_smoothing_alpha),
         )
 
         self.mask_pub = self.create_publisher(Image, publish_mask_topic, 10)
         self.overlay_pub = self.create_publisher(Image, publish_overlay_topic, 10)
         self.json_pub = self.create_publisher(String, publish_json_topic, 10)
 
-        # latest-frame-wins: DDS 层只保留最新 1 帧, 不排队旧帧
         latest_only_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -160,15 +187,15 @@ class GuqinStringRealtimeNode(Node):
             self.image_callback,
             latest_only_qos,
         )
-        # 推理不在图像回调里跑, 由定时器取"当前最新帧"处理,
-        # 处理期间到达的帧直接被覆盖丢弃, 延迟 = 单帧推理耗时
         self.process_timer = self.create_timer(0.02, self.process_latest)
 
         self.get_logger().info(
             f"listening image_topic={image_topic}, checkpoint={checkpoint_path}, "
             f"mode={inference_mode}, always_recalibrate={always_recalibrate}, "
             f"force_recalibrate_every_n={force_recalibrate_every_n}, "
-            f"tracker_recal_inlier_threshold={tracker_recal_inlier_threshold:.3f}"
+            f"tracker_recal_inlier_threshold={tracker_recal_inlier_threshold:.3f}, "
+            f"roi_inference={roi_inference}, "
+            f"tracker_smoothing_alpha={tracker_smoothing_alpha:.3f}"
         )
 
     def _draw_overlay(self, frame_bgr, endpoints):
@@ -203,7 +230,6 @@ class GuqinStringRealtimeNode(Node):
         return overlay
 
     def image_callback(self, msg: Image) -> None:
-        # 只覆盖最新帧, 绝不在这里跑模型
         with self._latest_lock:
             self._latest_msg = msg
 
@@ -256,7 +282,6 @@ class GuqinStringRealtimeNode(Node):
         mask_msg.header = msg.header
         self.mask_pub.publish(mask_msg)
 
-        # 没人看 overlay 就不画不发, 省下全分辨率绘制+序列化的开销
         if self.overlay_pub.get_subscription_count() > 0:
             overlay = self._draw_overlay(frame_bgr, result.endpoints)
             overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")

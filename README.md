@@ -1,14 +1,23 @@
 # Guqin String Detection with Azure Kinect and ROS2
 
-本项目用于使用 Azure Kinect DK 和 ROS2 对古琴琴弦进行实时视觉检测。系统从 Kinect RGB 图像中分割琴弦，拟合 7 根琴弦的 2D 端点，并可结合 Kinect 对齐深度图发布相机坐标系下的 3D 琴弦线段。
+本项目用于使用 Azure Kinect DK 和 ROS2 对古琴琴弦进行实时视觉检测。系统从 Kinect RGB 图像中分割琴弦，实时拟合 7 根琴弦的 2D 端点，并可结合 Kinect 对齐深度图发布相机坐标系下的 3D 琴弦线段。
 
 本仓库只包含视觉检测、深度定位和模型训练相关代码，不包含机械臂控制、灵巧手控制和自动演奏流程。
+
+## Demo
+
+![检测效果](./检测效果.gif)
 
 ## Features
 
 - Azure Kinect DK ROS2 驱动
 - 古琴琴弦 UNet 分割模型推理
 - 7 根琴弦实时跟踪和 2D 端点拟合
+- latest-frame-wins 图像处理：只处理最新帧，不积压旧帧
+- 默认 `resize` 推理模式，延迟低；也支持 `sliding` 高精度模式
+- ROI 推理加速：跟踪稳定后只对琴弦附近区域分割，必要时自动回退全图
+- 琴移动后的平移/小旋转恢复、快速 PCA 重标定和弦序对齐
+- overlay 按需发布：只有订阅者查看时才绘制叠加图，降低负载
 - 可选 Kinect 深度图反投影，输出 3D 琴弦线段
 - 支持用户准备自己的图片和 mask 后继续训练或微调模型
 
@@ -30,6 +39,7 @@
 │   ├── mask_to_strings.py
 │   ├── strings_realtime.py
 │   └── train.py
+├── 检测效果.gif
 └── README.md
 ```
 
@@ -39,8 +49,8 @@
 - `guqin_strings_3d_node.py`：基于 Kinect 深度图的 3D 琴弦定位节点
 - `guqin_runtime.py`：连接 ROS2 节点和 `SAM_guqin` 推理/跟踪代码的运行时封装
 - `eval.py`：UNet 权重加载和图像推理
-- `strings_realtime.py`：琴弦实时标定和跟踪
-- `mask_to_strings.py`：mask 到 7 根琴弦线段的拟合逻辑
+- `strings_realtime.py`：琴弦实时标定、跟踪、平移/旋转恢复和平滑
+- `mask_to_strings.py`：mask 到 7 根琴弦线段的完整拟合逻辑
 - `train.py`：UNet 训练和微调脚本
 
 ## Requirements
@@ -121,12 +131,6 @@ source ~/guqin_ws/install/setup.bash
 ~/guqin_ws/src/guqin-string-detection/SAM_guqin/checkpoints/guqin_best.pth
 ```
 
-目录不存在时先创建：
-
-```bash
-mkdir -p ~/guqin_ws/src/guqin-string-detection/SAM_guqin/checkpoints
-```
-
 可以下载作者提供的示例权重：
 
 ```bash
@@ -189,9 +193,17 @@ source ~/guqin_ws/install/setup.bash
 ros2 launch azure_kinect_ros2_driver k4a_guqin_realtime_launch.py
 ```
 
-3D 节点默认使用 Kinect 对齐深度图：
+该 launch 默认使用：
 
 ```text
+inference_mode=resize
+target_frame=rgb_camera_link
+```
+
+3D 节点默认输入：
+
+```text
+/guqin/strings_fit_json
 /k4a/depth_to_rgb/image_raw
 /k4a/rgb/camera_info
 ```
@@ -219,6 +231,14 @@ ros2 run rqt_image_view rqt_image_view
 /guqin/strings_overlay
 ```
 
+注意：为了降低负载，`/guqin/strings_overlay` 只有在有订阅者时才会绘制和发布。打开 `rqt_image_view` 后才会看到 overlay 图像。
+
+查看 mask：
+
+```text
+/guqin/strings_mask
+```
+
 查看 2D JSON：
 
 ```bash
@@ -238,6 +258,21 @@ ros2 topic hz /guqin/strings_fit_json
 ros2 topic hz /guqin/strings_3d_json
 ```
 
+节点日志会定期输出处理耗时和跟踪状态，例如：
+
+```text
+frame=120 seg=38ms track=4ms stale=52ms roi=1 inliers=0.96 shift=+0px
+```
+
+字段含义：
+
+- `seg`：分割耗时
+- `track`：琴弦拟合/跟踪耗时
+- `stale`：当前处理帧相对相机时间戳的延迟
+- `roi`：是否使用 ROI 推理
+- `inliers`：跟踪内点比例，越高越稳定
+- `shift`：tracker 自动应用的整体平移补偿
+
 ## Output Format
 
 ### 2D Strings
@@ -254,7 +289,7 @@ ros2 topic hz /guqin/strings_3d_json
 }
 ```
 
-其中 `u` 是图像列坐标，`v` 是图像行坐标，图像原点在左上角。
+其中 `u` 是图像列坐标，`v` 是图像行坐标，图像原点在左上角。JSON 中还包含运行状态字段，如 `inlier_ratio`、`seg_ms`、`track_ms`、`used_roi`、`shift_applied_px`。
 
 ### 3D Strings
 
@@ -350,8 +385,44 @@ cd ~/guqin_ws/src/guqin-string-detection/SAM_guqin
 python3 eval.py \
   --ckpt ./checkpoints/guqin_best.pth \
   --image ./eval01.jpg \
-  --mode sliding \
+  --mode resize \
   --threshold 0.5
+```
+
+## Runtime Modes
+
+推荐从默认配置开始：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py
+```
+
+如果需要更高的分割精度，可以尝试 `sliding`，但延迟会明显增加：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p inference_mode:=sliding
+```
+
+如果琴或相机在运行中会移动，推荐定期重标定：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p force_recalibrate_every_n:=10
+```
+
+如果调试拟合精度，可以打开每帧完整重标定：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p always_recalibrate:=true
+```
+
+如果 ROI 推理在某些画面中裁掉琴弦，可以关闭 ROI：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p roi_inference:=false
 ```
 
 ## Node Parameters
@@ -363,13 +434,17 @@ python3 eval.py \
 | `image_topic` | `/k4a/rgb/image_raw` | 输入 RGB 图像话题 |
 | `sam_guqin_dir` | 自动查找 `SAM_guqin` | 推理代码目录 |
 | `checkpoint_path` | `SAM_guqin/checkpoints/guqin_best.pth` | UNet 权重路径 |
-| `inference_mode` | `sliding` | 推理模式，支持 `sliding` 或 `resize` |
+| `inference_mode` | `resize` | 推理模式，支持 `resize` 或 `sliding`；`resize` 更快 |
 | `mask_threshold` | `0.5` | 分割阈值 |
 | `expected_strings` | `7` | 期望琴弦数量 |
 | `always_recalibrate` | `false` | 每个有效帧都重新完整拟合琴弦，最稳但更慢 |
 | `force_recalibrate_every_n` | `0` | 每 N 个有效帧强制重新完整拟合一次，0 表示关闭 |
 | `tracker_max_inlier_dist_px` | `8.0` | tracker 给采样点分配琴弦时允许的最大像素偏差 |
 | `tracker_recal_inlier_threshold` | `0.7` | tracker 内点比例低于该值时触发重新标定 |
+| `roi_inference` | `true` | 跟踪稳定后只对琴弦 ROI 分割，并在异常时回退全图 |
+| `roi_inference_pad_px` | `100` | ROI 外扩像素 |
+| `lock_theta_on_recalibration` | `true` | 重标定时用 PCA 快速估计主方向，避免慢速 Hough |
+| `tracker_smoothing_alpha` | `0.6` | 静止帧的 EMA 平滑系数；越小越稳，越大越灵敏 |
 | `publish_mask_topic` | `/guqin/strings_mask` | 输出 mask 话题 |
 | `publish_overlay_topic` | `/guqin/strings_overlay` | 输出叠加图话题 |
 | `publish_json_topic` | `/guqin/strings_fit_json` | 输出 2D JSON 话题 |
@@ -440,30 +515,45 @@ ros2 topic list | grep guqin
 
 ### Mask looks good but overlay lines are wrong
 
-如果 `/guqin/strings_mask` 看起来正常，但 `/guqin/strings_overlay` 中 7 根拟合线错位或串线，通常说明分割模型没有问题，问题在琴弦 tracker 没有及时重新标定。琴或相机移动后尤其容易出现这个现象。
+如果 `/guqin/strings_mask` 看起来正常，但 `/guqin/strings_overlay` 中 7 根拟合线错位或串线，通常说明分割模型没有问题，问题在 mask 到线段的拟合/跟踪阶段。
 
-调试时可以先使用最稳的模式：每帧都重新完整拟合琴弦。
+先用每帧完整重标定确认完整拟合是否可靠：
 
 ```bash
 ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
   -p always_recalibrate:=true
 ```
 
-如果这样 overlay 变准，说明模型和 mask 是可用的，只是 tracker 参数需要更保守。实时运行时可改成定期重标定：
+如果这样 overlay 变准，说明模型和 mask 是可用的。实时运行时可改成定期重标定：
 
 ```bash
 ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
   -p force_recalibrate_every_n:=5
 ```
 
-或者提高 tracker 的重标定敏感度：
+如果琴移动后 ROI 可能裁掉琴弦，可关闭 ROI 测试：
+
+```bash
+ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
+  -p roi_inference:=false
+```
+
+如果仍然偶发串线，可提高 tracker 的重标定敏感度：
 
 ```bash
 ros2 run azure_kinect_ros2_driver guqin_string_realtime_node.py --ros-args \
   -p tracker_recal_inlier_threshold:=0.9
 ```
 
-如果琴在运行过程中会被移动，建议优先使用 `force_recalibrate_every_n`，例如 5 或 10。代价是 CPU/GPU 负载更高、输出频率更低，但拟合稳定性会明显更好。
+### Overlay topic has no image
+
+`/guqin/strings_overlay` 为按需发布。请先启动订阅者：
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+然后选择 `/guqin/strings_overlay`。如果没有订阅者，节点不会绘制 overlay，以节省计算和序列化开销。
 
 ### No `/guqin/strings_3d_json`
 
@@ -476,3 +566,9 @@ ros2 topic echo /k4a/rgb/camera_info --once
 ```
 
 默认 `target_frame` 是 `rgb_camera_link`。如果改成其他坐标系，需要保证 TF 树里存在从 Kinect frame 到目标 frame 的变换。
+
+## Notes
+
+- 本仓库不包含 `.pth` 模型权重和大规模数据集文件，建议通过 Hugging Face 或其他数据仓库分发。
+- 本仓库不包含 Segment Anything 标注工具和 `sam_vit_h.pth`。
+- 本仓库不包含机械臂控制和自动演奏代码。
